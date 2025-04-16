@@ -1,0 +1,8 @@
+datasets:
+    # 原始数据集 - 正常使用CoT
+    - json_path: /data/home/yangxiaoda/lch/datasets/rec_jsons_processed/refcoco_train.json
+      sampling_strategy: random:3000
+    
+    # 带patch的数据集 - 不使用CoT
+    - json_path: /data/home/yangxiaoda/lch/datasets/rec_jsons_processed/refcoco_train_patched.json
+      sampling_strategy: random:2000

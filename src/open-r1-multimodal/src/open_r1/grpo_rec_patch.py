@@ -12,24 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# import debugpy
-# try:
-#     # 5678 is the default attach port in the VS Code debug configurations. Unless a host and port are specified, host defaults to 127.0.0.1
-#     debugpy.listen(("localhost", 9501))
-#     print("Waiting for debugger attach")
-#     debugpy.wait_for_client()
-# except Exception as e:
-#     pass
-
 import os
 import pdb
 import re
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
 
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from transformers import Qwen2VLForConditionalGeneration
 
 from math_verify import parse, verify
@@ -54,12 +45,12 @@ class GRPOScriptArguments(ScriptArguments):
 
     Args:
         reward_funcs (`list[str]`):
-            List of reward functions. Possible values: 'accuracy', 'format'.
+            List of reward functions. Possible values: 'accuracy', 'format', 'adaptive_format'.
     """
 
     reward_funcs: list[str] = field(
-        default_factory=lambda: ["accuracy", "format"],
-        metadata={"help": "List of reward functions. Possible values: 'accuracy', 'format'"},
+        default_factory=lambda: ["accuracy", "adaptive_format"],
+        metadata={"help": "List of reward functions. Possible values: 'accuracy', 'format', 'adaptive_format'"},
     )
     max_pixels: Optional[int] = field(
         default=12845056,
@@ -77,6 +68,10 @@ class GRPOScriptArguments(ScriptArguments):
         default=None,
         metadata={"help": "Root directory of the image"},
     )
+    no_cot_template: Optional[str] = field(
+        default="Answer this question about the image: {Question} Provide only the answer in <answer> </answer> tags.",
+        metadata={"help": "Template for inputs that should not use CoT"},
+    )
 
 @dataclass
 class GRPOModelConfig(ModelConfig):
@@ -90,12 +85,34 @@ SYSTEM_PROMPT = (
     "<think> reasoning process here </think><answer> answer here </answer>"
 )
 
+def patch_aware_collate_fn(examples):
+    """处理包含should_use_cot标志的batch数据"""
+    # 确保返回一个字典列表，而不是字段字典 
+    # 这样_generate_and_score_completions函数中的[x["prompt"] for x in inputs]才能正常工作
+    
+    # 将每个should_use_cot标志添加到对应的示例中
+    processed_examples = []
+    for example in examples:
+        # 创建一个新的示例字典，包含所有原始字段
+        processed_example = {}
+        for key, value in example.items():
+            processed_example[key] = value
+        
+        # 确保should_use_cot存在
+        if "should_use_cot" not in processed_example:
+            processed_example["should_use_cot"] = True
+        
+        processed_examples.append(processed_example)
+    
+    return processed_examples
+
 class LazySupervisedDataset(Dataset):
-    def __init__(self, data_path: str, script_args: GRPOScriptArguments, question_template: str):
+    def __init__(self, data_path: str, script_args: GRPOScriptArguments, question_template: str, no_cot_template: str = None):
         super(LazySupervisedDataset, self).__init__()
         self.script_args = script_args
         self.list_data_dict = []
         self.question_template = question_template
+        self.no_cot_template = no_cot_template or script_args.no_cot_template
 
         if data_path.endswith(".yaml"):
             with open(data_path, "r") as file:
@@ -158,27 +175,14 @@ class LazySupervisedDataset(Dataset):
                     {"role": "user", "content": example["problem"]},
                 ],
             }
-        QUESTION_TEMPLATE = self.question_template
-        def make_conversation_image(example):
-            # pdb.set_trace()
-            return {
-                "prompt": [
-                    # {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image"},
-                            {"type": "text", "text": QUESTION_TEMPLATE.format(Question=example["problem"])},
-                            # 'Please provide the bounding box coordinate of the region this sentence describes: woman. First output the thinking process in <think> </think> tags and then output the final answer in <answer> </answer> tags. Output the final answer in JSON format.'
-                        ],
-                    },
-                ],
-            }
-
+        
         example = self.list_data_dict[i]
         image_root = self.script_args.image_root
         if 'image' in example:
             image_path = os.path.join(image_root, example['image'])
+            # print(f"image_root: {image_root}")
+            # print(f"image_path: {image_path}")
+            # pdb.set_trace()
             # In case the image is not found
             while not os.path.exists(image_path):
                 print(f"Warning: Image {image_path} not found, randomly selecting another image")
@@ -189,12 +193,29 @@ class LazySupervisedDataset(Dataset):
         else:
             image = None
         
+        # 判断是否应该使用CoT模板
+        should_use_cot = example.get('should_use_cot', True)
+        template = self.question_template if should_use_cot else self.no_cot_template
+        
+        def make_conversation_image(example, template):
+            return {
+                "prompt": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image"},
+                            {"type": "text", "text": template.format(Question=example["problem"])},
+                        ],
+                    },
+                ],
+            }
 
         return {
             'image': image,
             'problem': example['problem'],
             'solution': example['solution'],
-            'prompt': make_conversation_image(example)['prompt'] if 'image' in example else make_conversation(example)['prompt'],
+            'prompt': make_conversation_image(example, template)['prompt'] if 'image' in example else make_conversation(example)['prompt'],
+            'should_use_cot': should_use_cot
         }
 
 
@@ -206,6 +227,109 @@ def get_vlm_module(model_name_or_path):
     else:
         raise ValueError(f"Unsupported model: {model_name_or_path}")
 
+class PatchAwareGRPOTrainer(VLMGRPOTrainer):
+    def compute_reward(self, completions, **kwargs):
+        # 处理 should_use_cot 参数
+        should_use_cot = None
+        if "should_use_cot" in kwargs:
+            should_use_cot = kwargs.pop("should_use_cot")  # 从kwargs中移除，避免父类方法报错
+        elif hasattr(self, "_buffered_inputs") and self._buffered_inputs and "should_use_cot" in self._buffered_inputs[self._step % self.args.gradient_accumulation_steps]:
+            # 从缓存的输入中获取should_use_cot
+            should_use_cot = self._buffered_inputs[self._step % self.args.gradient_accumulation_steps]["should_use_cot"]
+        
+        # 调用父类方法获取基本奖励
+        rewards = super().compute_reward(completions, **kwargs)
+        
+        # 对于adaptive_format_reward，传递should_use_cot参数
+        for i, reward_func in enumerate(self.reward_funcs):
+            if reward_func.__name__ == "adaptive_format_reward" and should_use_cot is not None:
+                # 直接调用adaptive_format_reward
+                format_rewards = adaptive_format_reward(completions, should_use_cot=should_use_cot, **kwargs)
+                # 更新对应位置的奖励
+                for j, reward in enumerate(format_rewards):
+                    rewards[j] = reward
+                break
+        
+        return rewards
+    
+    def get_train_dataloader(self):
+        """覆盖原方法，使用自定义的collate_fn"""
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+        
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.args.per_device_train_batch_size,
+            collate_fn=patch_aware_collate_fn,
+            shuffle=True,
+            num_workers=self.args.dataloader_num_workers,
+        )
+    
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """覆盖计算损失的方法，确保正确处理should_use_cot标志"""
+        # 提取should_use_cot标志，以便在调用_generate_and_score_completions时使用
+        should_use_cot = [x.get("should_use_cot", True) for x in inputs]
+        
+        # 使用父类的compute_loss方法
+        return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
+    
+    def _generate_and_score_completions(self, inputs, model):
+        """覆盖_generate_and_score_completions方法，确保正确处理should_use_cot标志"""
+        # 提取should_use_cot标志，以便在计算奖励时使用
+        should_use_cot = [x.get("should_use_cot", True) for x in inputs]
+        
+        # 创建一个新的inputs字典，不包含should_use_cot
+        clean_inputs = []
+        for x in inputs:
+            clean_input = {k: v for k, v in x.items() if k != "should_use_cot"}
+            clean_inputs.append(clean_input)
+        
+        # 调用父类的_generate_and_score_completions方法
+        results = super()._generate_and_score_completions(clean_inputs, model)
+        
+        # 将should_use_cot添加到结果中，以便在adaptive_format_reward中使用
+        results["should_use_cot"] = should_use_cot
+        
+        return results
+
+def adaptive_format_reward(completions, should_use_cot: List[bool] = None, **kwargs):
+    """根据图像是否有patch来评估输出格式，增加奖励差异"""
+    import re
+    
+    if should_use_cot is None:
+        should_use_cot = [True] * len(completions[0])
+    
+    completion_contents = [completion[0]["content"] for completion in completions]
+    rewards = []
+    
+    for content, use_cot in zip(completion_contents, should_use_cot):
+        # 检查是否包含思维标签
+        has_think_tag = re.search(r"<think>.*?</think>", content, re.DOTALL) is not None
+        # 检查是否包含答案标签和边界框
+        has_answer_tag = re.search(r"<answer>.*?\{.*\[\d+,\s*\d+,\s*\d+,\s*\d+\].*\}.*?</answer>", content, re.DOTALL) is not None
+        
+        # 计算奖励，提高惩罚强度
+        if use_cot:
+            # 应该使用CoT：需要思维和答案标签
+            reward = 1.0 if (has_think_tag and has_answer_tag) else -0.5
+        else:
+            # 不应使用CoT：只需要答案标签，不要思维标签
+            reward = 1.0 if (has_answer_tag and not has_think_tag) else -0.5
+        
+        rewards.append(reward)
+        
+        current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
+        if os.getenv("DEBUG_MODE") == "true":
+            log_path = os.getenv("LOG_PATH")
+            with open(log_path, "a") as f:
+                f.write(f"------------- {current_time} Format reward: {reward} -------------\n")
+                f.write(f"Should use CoT: {use_cot}\n")
+                f.write(f"Has think tag: {has_think_tag}\n")
+                f.write(f"Has answer tag: {has_answer_tag}\n")
+                f.write(f"Content: {content}\n")
+    
+    return rewards
+
 def main(script_args, training_args, model_args):
     # Load the VLM module
     vlm_module_cls = get_vlm_module(model_args.model_name_or_path)
@@ -214,18 +338,20 @@ def main(script_args, training_args, model_args):
     reward_funcs_registry = {
         "accuracy": vlm_module_cls.iou_reward,
         "format": vlm_module_cls.format_reward_rec,
+        "adaptive_format": adaptive_format_reward,
     }
     reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
     print("reward_funcs:", reward_funcs)
 
     # Load the dataset
-    """
-    question_template:
-       "{Question} First output the thinking process in <think> </think> tags and then output the final answer in <answer> </answer> tags. Output the final answer in JSON format."
-    """
-    dataset = LazySupervisedDataset(script_args.dataset_name, script_args, question_template=vlm_module_cls.get_question_template(task_type="rec"))
+    dataset = LazySupervisedDataset(
+        script_args.dataset_name, 
+        script_args, 
+        question_template=vlm_module_cls.get_question_template(task_type="rec"),
+        no_cot_template=script_args.no_cot_template
+    )
 
-    trainer_cls = VLMGRPOTrainer
+    trainer_cls = PatchAwareGRPOTrainer
     # Initialize the GRPO trainer
     trainer = trainer_cls(
         model=model_args.model_name_or_path,
@@ -258,4 +384,4 @@ if __name__ == "__main__":
     if training_args.deepspeed and "zero3" in training_args.deepspeed:
         print("zero3 is used, qwen2_5vl forward monkey patch is applied")
         monkey_patch_qwen2_5vl_forward()
-    main(script_args, training_args, model_args)
+    main(script_args, training_args, model_args) 
